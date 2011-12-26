@@ -1,12 +1,13 @@
 /**
- * @fileoverview Serve a static resource in response to HTTP requests, and then
- *  keep the connection open until infeasable.  Re-invent the wheel
- *  and create a custom tcp & http stack, since that lets them act subtly
- *  different from standard implementations.
+ * @fileoverview Serve a static resource in response to HTTP requests.
+ *  Re-invent the wheel and use a custom tcp & http stack, since that
+ *  lets us fully control the implementation.
  */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
+#include <pcap.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,89 +88,119 @@ void release(struct sockaddr* remote) {
 }
 
 /**
- * The Socket.
+ * The Handle.
  */
-int s;
+pcap_t* s;
 
 /**
- * Make sure the socket is killed on quit, so we don't leave a mess behind.
+ * Make sure the handle is killed on quit, so we don't leave a mess behind.
  */
 void leave() {
   release(NULL);
-  free(clients);  
-  close(s);
+  free(clients);
+  if (s != NULL) {
+    pcap_close(s);
+  }
   exit(0);
 }
 
-int checkip(char* packet) {
-  int ip_hdr_len = 0;
-  unsigned int source_address = 0;
-  unsigned short source_port, destination_port;
-  struct in_addr src;
-
-  // IPv4.
-  if ((packet[0] & (16 + 32 + 64 + 128)) != 64) {
-    return 0;
-  }
-  // TCP.
-  if (packet[9] != 6) {
-    return 0;
+pcap_t* startup(char* dev, int port) {
+  char errbuf[PCAP_ERRBUF_SIZE], filter[64];
+  struct bpf_program fp;
+  bpf_u_int32 net, mask;
+  pcap_t *handle;
+  if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
+    fprintf(stderr, "Couldn't get netmask for device %s\n", dev);
+    net = 0;
+    mask = 0;
   }
 
-  source_address = packet[12] << 24 + packet[13] << 16 + packet[14] << 8 + packet[15];
-  ip_hdr_len = 4 * (packet[0] & (1 + 2 + 4 + 8));
+  // Open the device.
+  handle = pcap_open_live(
+      dev,     // The device to open
+      BUFSIZ,  // How much data to wait for
+      1,       // Promiscuous?
+      50,      // timeout in ms
+      errbuf); // Error buffer.
+  if (handle == NULL) {
+    fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
+    return NULL;
+  }
 
-  source_port = packet[ip_hdr_len] << 8 + packet[ip_hdr_len + 1];
-  destination_port = packet[ip_hdr_len + 2] << 8 + packet[ip_hdr_len + 3];
+  // Match packets meant for our desired port.  This rule may also match outbound traffic.
+  sprintf(filter, "tcp dst port %d", port);
+  if (pcap_compile(handle, &fp, filter, 0, net) == -1) {
+    fprintf(stderr, "Could not compile BPF: %s\n", pcap_geterr(handle));
+    pcap_close(handle);
+    return NULL;
+  }
 
-  printf("packet from %d:%d to %d\n",source_address , source_port, destination_port); 
-
-  return 1;
+  if (pcap_setfilter(handle, &fp) == -1) {
+    fprintf(stderr, "Could not install BPF: %s\n", pcap_geterr(handle));
+    pcap_close(handle);
+    return NULL;
+  }
+  return handle;
 }
 
-void tcpalyze(char* packet) {
-  printf("\n");
+void got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
+  const struct ip *iphdr;
+  u_int size_ip;
+  char src[32],dest[32];
+
+  iphdr = (struct ip*)(packet + 14);
+  if (iphdr->ip_v != 4 || iphdr->ip_hl < 5) {
+    return;
+  }
+  size_ip = iphdr->ip_hl * 4 + 14;
+
+  inet_ntop(AF_INET, &iphdr->ip_dst, dest, 32);
+  inet_ntop(AF_INET, &iphdr->ip_src, src, 32);
+
+  printf("packet from %s to %s\n", src , dest);
 }
 
-int main() {
-  struct sockaddr_storage cin;
+int main(int argc, char *argv[]) {
+  char *dev, errbuf[PCAP_ERRBUF_SIZE];
+  int c;
+  int port = 8888;
   struct clientState* client;
-  socklen_t b = sizeof(cin);
-  int i;
-  char buffer[BUFFER_SIZE];
+  dev = pcap_lookupdev(errbuf);
   clients = malloc(MAX_CLIENTS * sizeof(struct clientState*));
-  
 
   // Register signal handlers for cleanup.
   signal(SIGINT, leave);
   signal(SIGTERM, leave);
   signal(SIGQUIT, leave);
 
-  // Accept raw packets.
-  if ((s = socket(PF_INET, SOCK_RAW, IPPROTO_TCP)) < 0) {
-    perror("socket creation failed.");
-    exit(1);
-  }
-
-  // Include IP Header
-  i = 1;
-  if (setsockopt (s, IPPROTO_IP, IP_HDRINCL, &i, sizeof (i)) < 0) {
-    perror("Could not include ip headers.");
-    exit(1);
-  }
-  // Allow socket reuse.
-  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &b, sizeof(b));
-
-
-  while(1) {
-    i = recvfrom(s, buffer, sizeof(buffer), 0, (struct sockaddr*)&cin, &b);
-    buffer[i] = '\0';
-    if (!checkip(buffer)) {
-      continue;
+  // Process Options.
+  while ((c = getopt (argc, argv, "hd:p:")) != -1) {
+    switch (c) {
+      case 'd':
+        dev = optarg;
+        break;
+      case 'p':
+        port = atoi(optarg);
+        break;
+      case 'h':
+      default:
+        printf("Usage: %s [-d device] [-p port]\n", argv[0]);
+        return 1;
     }
-    // client = get((struct sockaddr*)&cin);
-    fflush(stdout);
   }
 
-  exit(0);
+  if (dev == NULL) {
+    fprintf(stderr, "Couldn't find default device: %s\n", errbuf);
+	return 2;
+  }
+  printf("Using Device %s\n", dev);
+  s = startup(dev, port);
+  
+  if (s != NULL) {
+    if (pcap_loop(s, 0, got_packet, NULL) != 0) {
+      fprintf(stderr, "Processing unsuccessful: %s\n", pcap_geterr(s));
+    }
+    pcap_close(s);
+  }
+  return 0;
 }
